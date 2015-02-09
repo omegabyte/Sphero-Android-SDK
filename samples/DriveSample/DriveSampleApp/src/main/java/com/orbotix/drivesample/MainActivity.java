@@ -2,17 +2,31 @@ package com.orbotix.drivesample;
 
 import android.app.Activity;
 import android.app.FragmentTransaction;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.Switch;
+import android.widget.TextView;
+
+import com.github.mikephil.charting.charts.LineChart;
+import com.github.omegabyte.drivesample.PaintView;
 import com.orbotix.ConvenienceRobot;
 import com.orbotix.Ollie;
+import com.orbotix.SensorControl;
 import com.orbotix.Sphero;
+import com.orbotix.async.DeviceSensorAsyncMessage;
 import com.orbotix.calibration.api.CalibrationEventListener;
 import com.orbotix.calibration.api.CalibrationImageButtonView;
 import com.orbotix.calibration.api.CalibrationView;
@@ -20,20 +34,32 @@ import com.orbotix.classic.DiscoveryAgentClassic;
 import com.orbotix.classic.RobotClassic;
 import com.orbotix.colorpicker.api.ColorPickerEventListener;
 import com.orbotix.colorpicker.api.ColorPickerFragment;
+import com.orbotix.command.RawMotorCommand;
 import com.orbotix.common.*;
+import com.orbotix.common.internal.AsyncMessage;
+import com.orbotix.common.internal.DeviceResponse;
+import com.orbotix.common.sensor.DeviceSensorsData;
+import com.orbotix.common.sensor.LocatorSensor;
+import com.orbotix.common.sensor.SensorFlag;
 import com.orbotix.joystick.api.JoystickEventListener;
 import com.orbotix.joystick.api.JoystickView;
 import com.orbotix.le.DiscoveryAgentLE;
 import com.orbotix.le.RobotLE;
 import com.orbotix.robot_picker.RobotPickerDialog;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity implements RobotPickerDialog.RobotPickerListener,
                                                       DiscoveryAgentEventListener,
-                                                      RobotChangedStateListener {
+                                                      RobotChangedStateListener, ResponseListener{
 
     private static final String TAG = "MainActivity";
+    private static final int DEFAULT_SPIN_SPEED = 80;
+    private static final int MINIMUM_MOTOR_SPEED = 40;
+    private static final int MAXIMUM_MOTOR_SPEED = 250;
+    private static final int MAXIMUM_GRAPH_LENGTH = 80;
+
 
     /**
      * Our current discovery agent that we will use to find robots of a certain protocol
@@ -76,6 +102,10 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
     private Button _colorPickerButton;
 
     /**
+     * The button to set spin mode
+     */
+    private Switch _spinSwitch;
+    /**
      * The button to set developer mode
      */
     private Switch _developerModeSwitch;
@@ -85,14 +115,67 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
      */
     private LinearLayout _developerModeLayout;
 
+    private SeekBar _speedSeek;
+
+    private LineChart _graph;
+
+    private TextView _RSSI_value;
+    private TextView _RSSI_median;
+    private TextView _gyro;
+    private TextView _accel;
+    private TextView _location;
+    private Button _orientButton;
+
+    private LocatorSensor mNormalizedLocation;
+    private LocatorSensor mLastLocation;
+    private RSSI_Service mRSSIservice;
+    private final ServiceConnection mServiceConnection = new ServiceConnection() {
+
+        @Override
+        public void onServiceConnected(ComponentName componentName,
+                                       IBinder service) {
+
+            Log.d(TAG, "Attempting to initialize RSSI service.");
+            mRSSIservice = ((RSSI_Service.LocalBinder) service)
+                    .getService();
+            if (!mRSSIservice.initialize()) {
+                Log.e(TAG, "Unable to initialize Bluetooth");
+                finish();
+            }
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName componentName) {
+            Log.d(TAG, "Bluetooth Service Disconnected");
+            mRSSIservice = null;
+        }
+    };
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
 
+
+        setupGraph();
+        setupLocatorButton();
+        setupOrientationButton();
+        setupSpinButton();
+        setupSpeedSeeker();
         setupJoystick();
         setupCalibration();
         setupColorPicker();
+        mNormalizedLocation = updateLocation(new LocatorSensor(),0,0);
+        mLastLocation = updateLocation(new LocatorSensor(),0,0);
+
+        Log.d(TAG,"Creating Intent");
+        Intent gattServiceIntent = new Intent(this, RSSI_Service.class);
+        Log.d(TAG,"Binding Service");
+        if (bindService(gattServiceIntent, mServiceConnection, BIND_AUTO_CREATE))
+            Log.d(TAG,"Binding task finished.");
+        else
+            Log.d(TAG, "Binding unsuccessful.");
+
 
         // Here, you need to route all the touch events to the joystick and calibration view so that they know about
         // them. To do this, you need a way to reference the view (in this case, the id "entire_view") and attach
@@ -106,6 +189,50 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 return true;
             }
         });
+
+        registerReceiver(mGattUpdateReceiver, makeGattUpdateIntentFilter());
+        //mRSSIService = new RSSI_Service();
+
+
+
+        setupLocalizerButton();
+    }
+
+    private void spinRobot(ConvenienceRobot robot, int speed) {
+        if(speed > MINIMUM_MOTOR_SPEED) {
+            robot.setRawMotors(
+                    RawMotorCommand.MotorMode.MOTOR_MODE_FORWARD,
+                    speed,
+                    RawMotorCommand.MotorMode.MOTOR_MODE_REVERSE,
+                    speed);
+        }else if (speed < MINIMUM_MOTOR_SPEED){
+            robot.setRawMotors(
+                    RawMotorCommand.MotorMode.MOTOR_MODE_REVERSE,
+                    speed,
+                    RawMotorCommand.MotorMode.MOTOR_MODE_FORWARD,
+                    speed);
+        }
+        else{
+            //stop?
+            robot.stop();
+            robot.setRawMotors(
+                    RawMotorCommand.MotorMode.MOTOR_MODE_BRAKE,
+                    0,
+                    RawMotorCommand.MotorMode.MOTOR_MODE_BRAKE,
+                    0);
+        }
+    }
+
+    private static IntentFilter makeGattUpdateIntentFilter() {
+        final IntentFilter intentFilter = new IntentFilter();
+
+        intentFilter.addAction(RSSI_Service.ACTION_GATT_CONNECTED);
+        intentFilter.addAction(RSSI_Service.ACTION_GATT_DISCONNECTED);
+        intentFilter.addAction(RSSI_Service.ACTION_GATT_SERVICES_DISCOVERED);
+        intentFilter.addAction(RSSI_Service.ACTION_DATA_AVAILABLE);
+        intentFilter.addAction(RSSI_Service.ACTION_GATT_RSSI);
+
+        return intentFilter;
     }
 
     @Override
@@ -121,11 +248,21 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
         if (!_robotPickerDialog.isShowing()) {
             _robotPickerDialog.show();
         }
+/*
+        _currentDiscoveryAgent = DiscoveryAgentLE.getInstance();
+        // Now that we have a discovery agent, we will start discovery on it using the method defined below
+        startDiscovery();
+*/
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+
+        unregisterReceiver(mGattUpdateReceiver);
+        if (mServiceConnection != null)
+            unbindService(mServiceConnection);
+
         if (_currentDiscoveryAgent != null) {
             // When pausing, you want to make sure that you let go of the connection to the robot so that it may be
             // accessed from within other applications. Before you do that, it is a good idea to unregister for the robot
@@ -145,6 +282,7 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 r.sleep();
             }
         }
+        mRSSIservice.close();
     }
 
     /**
@@ -193,9 +331,11 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
             // The SDK will automatically connect to the robot that you touch the phone to, and you will get a message
             // saying that the robot has connected. For now, let's just log the robots that we are seeing.
             Log.v(TAG, "Robots: " + robots.toString());
+            if (_robotPickerDialog.isShowing()) {
+                _robotPickerDialog.dismiss();
+            }
         }
     }
-
     /**
      * Invoked when a robot changes state. For example, when a robot connects or disconnects.
      * @param robot The robot whose state changed
@@ -206,7 +346,7 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
         // For the purpose of this sample, we'll only handle the connected and disconnected notifications
         switch (type) {
             // A robot was connected, and is ready for you to send commands to it.
-            case Connected:
+            case Online:
                 // When a robot is connected, this is a good time to stop discovery. Discovery takes a lot of system
                 // resources, and if left running, will cause your app to eat the user's battery up, and may cause
                 // your application to run slowly. To do this, use DiscoveryAgent#stopDiscovery().
@@ -218,7 +358,7 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 _joystick.setEnabled(true);
                 _calibrationView.setEnabled(true);
                 _colorPickerButton.setEnabled(true);
-                _calibrationButtonView.setEnabled(true);
+//                _calibrationButtonView.setEnabled(true);
 
                 // Depending on what was connected, you might want to create a wrapper that allows you to do some
                 // common functionality related to the individual robots. You can always of course use the
@@ -226,10 +366,14 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 if (robot instanceof RobotLE) {
                     _connectedRobot = new Ollie(robot);
 
+                    _connectedRobot.addResponseListener(this);
                     // Ollie has a developer mode that will allow a developer to poke at Bluetooth LE data manually
                     // without being disconnected. Here we set up the button to be able to enable or disable
                     // developer mode on the robot.
                     setupDeveloperModeButton();
+
+                    Log.d(TAG,"Attempting to connect to Robot.");
+                    mRSSIservice.connect(robot.getIdentifier());
                 }
                 else if (robot instanceof RobotClassic) {
                     _connectedRobot = new Sphero(robot);
@@ -245,7 +389,7 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 _joystick.setEnabled(false);
                 _calibrationView.setEnabled(false);
                 _colorPickerButton.setEnabled(false);
-                _calibrationButtonView.setEnabled(false);
+                //_calibrationButtonView.setEnabled(false);
 
                 // Disable the developer mode button when the robot disconnects so that it can be set up if a LE robot
                 // connectes again
@@ -262,6 +406,254 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 break;
         }
     }
+
+    private void setupSpeedSeeker(){
+        _speedSeek = (SeekBar)findViewById(R.id.speedSeek);
+        _speedSeek.setMax(MAXIMUM_MOTOR_SPEED);
+        _speedSeek.setProgress(DEFAULT_SPIN_SPEED);
+        _speedSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int i, boolean b) {
+
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if(_spinSwitch.isChecked()){
+                    spinRobot(_connectedRobot, _speedSeek.getProgress());
+                }
+
+            }
+        });
+    }
+    private void setupOrientationButton(){
+        _orientButton = (Button)findViewById(R.id.zeroHeading);
+        _orientButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                if (_connectedRobot != null) {
+                    Log.d(TAG, "Zeroing Orientation.");
+                    _connectedRobot.rotate(0);//drive(0,0);
+                }
+            }
+        });
+    }
+    private void setupLocatorButton(){
+        _orientButton = (Button)findViewById(R.id.zeroLocation);
+        _orientButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                Log.d(TAG, "Zeroing Location.");
+                if(mNormalizedLocation != null && mLastLocation != null){
+                    updateLocation(mNormalizedLocation,mLastLocation);
+                }else{
+                    Log.w(TAG,"Unable to add new normalized Location data");
+                }
+            }
+        });
+    }
+    Button _localizerButton;
+    PaintView paintView;
+    private void setupLocalizerButton(){
+        Button addRobotButton = (Button)findViewById(R.id.addRobot);
+        addRobotButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                Log.d(TAG,"addRobot");
+                // Create a robot picker dialog, this allows the user to select which robot they would like to connect to.
+                // We don't need to do this step if we know which robot we want to talk to, and don't need the user to
+                // decide that.
+                // Show the picker only if it's not showing. This keeps multiple calls to onStart from showing too many pickers.
+                if (_robotPickerDialog != null && !_robotPickerDialog.isShowing()) {
+
+                    Log.d(TAG,"addRobot-show()");
+                    _robotPickerDialog.show();
+                }
+            }
+        });
+        _localizerButton = (Button)findViewById(R.id.localizer);
+        _localizerButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                setContentView(R.layout.multi);
+                if(_setupButton == null){
+                    setupSetupButton();
+                }
+                if(paintView == null){
+
+                    // Getting reference to PaintView
+                     paintView = (PaintView)findViewById(R.id.paint_view);
+
+                    // Getting reference to TextView tv_cooridinate
+                    //TextView tvCoordinates = (TextView)findViewById(R.id.tv_coordinates);
+
+                    // Passing reference of textview to PaintView object to update on coordinate changes
+                    //paintView.setTextView(tvCoordinates);
+
+                    // Setting touch event listener for the PaintView
+                    paintView.setOnTouchListener(paintView);
+                }
+            }
+        });
+    }
+    Button _setupButton;
+    private void setupSetupButton(){
+        _setupButton = (Button)findViewById(R.id.setup);
+        _setupButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+
+                setContentView(R.layout.main);
+                // Create a robot picker dialog, this allows the user to select which robot they would like to connect to.
+                // We don't need to do this step if we know which robot we want to talk to, and don't need the user to
+                // decide that.
+                // Show the picker only if it's not showing. This keeps multiple calls to onStart from showing too many pickers.
+                /*if (!_robotPickerDialog.isShowing()) {
+                    _robotPickerDialog.show();
+                }*/
+            }
+        });
+    }
+    private void setupSpinButton() {
+
+        _spinSwitch = (Switch)findViewById(R.id.spinSwitch);
+
+        _spinSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                if(_connectedRobot == null){
+                    _spinSwitch.setChecked(false);
+                    return;
+                }
+                if (isChecked){
+                    Log.i(TAG,"Commanding robot to spin.");//spin
+                    _joystick.setEnabled(false);
+                    spinRobot(_connectedRobot, _speedSeek.getProgress());
+                    mRSSIservice.clearMedian();
+                    mRSSIservice.collectMedian(true);
+
+                }
+                else{
+                    _joystick.setEnabled(true);
+                    Log.i(TAG, "Commanding robot to stop spinning.");//stop spin
+                    _connectedRobot.stop();
+                    mRSSIservice.collectMedian(false);
+                    //_connectedRobot.drive(0,0);
+                }
+            }
+        });
+    }
+
+    //LineDataSet _dataRSSIraw;
+    //LineData _dataGraph;
+
+    private void setupGraph(){
+        _RSSI_value = (TextView) findViewById(R.id.rssi_val);
+        _RSSI_median = (TextView) findViewById(R.id.rssi_median);
+        _location = (TextView) findViewById(R.id.locator);
+        _accel = (TextView) findViewById(R.id.accelerometer);
+        _gyro = (TextView) findViewById(R.id.gyrometer);
+        //_graph = (LineChart) findViewById(R.id.graph);
+        /*
+        ArrayList<Entry> entries = new ArrayList<>();
+
+        _dataRSSIraw = new LineDataSet( entries , "RSSI data");
+
+        // set the line to be drawn like this "- - - - - -"
+        _dataRSSIraw.enableDashedLine(10f, 5f, 0f);
+        _dataRSSIraw.setColor(Color.BLACK);
+        _dataRSSIraw.setCircleColor(Color.BLACK);
+        _dataRSSIraw.setLineWidth(1f);
+        _dataRSSIraw.setCircleSize(4f);
+        _dataRSSIraw.setFillAlpha(65);
+        _dataRSSIraw.setFillColor(Color.BLACK);
+
+        ArrayList<LineDataSet> dataSets = new ArrayList<LineDataSet>();
+        dataSets.add(_dataRSSIraw); // add the datasets
+
+        ArrayList<String> xVals = new ArrayList<String>();
+        for (int i = 0; i < MAXIMUM_GRAPH_LENGTH; i++) {
+            xVals.add((i) + "");
+        }
+
+        // create a data object with the datasets
+        _dataGraph = new LineData(xVals, dataSets);
+
+        //_graph.setData(_dataGraph);
+        */
+        /*setData(MAXIMUM_GRAPH_LENGTH, 100);
+        _dataGraph = _graph.getData();
+        _dataRSSIraw = _dataGraph.getDataSetByLabel("rssi_data", false);
+        if(_dataRSSIraw == null){
+            Log.w(TAG,"NULL DATA SET");
+        }
+        _graph.invalidate();*/
+
+    }
+    //todo: remove set
+
+    /*private void setData(int count, float range) {
+
+        ArrayList<String> xVals = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            xVals.add((i) + "");
+        }
+
+        ArrayList<Entry> yVals = new ArrayList<>();
+
+        for (int i = 0; i < count; i++) {
+            float mult = (range + 1);
+            float val = (float) (Math.random() * mult) + 3;// + (float)
+            // ((mult *
+            // 0.1) / 10);
+            yVals.add(new Entry(val, i));
+        }
+
+        // create a dataset and give it a type
+        LineDataSet set1 = new LineDataSet(yVals, "rssi_data");
+        // set1.setFillAlpha(110);
+        // set1.setFillColor(Color.RED);
+
+        // set the line to be drawn like this "- - - - - -"
+        set1.enableDashedLine(10f, 5f, 0f);
+        set1.setColor(Color.BLACK);
+        set1.setCircleColor(Color.BLACK);
+        set1.setLineWidth(1f);
+        set1.setCircleSize(4f);
+        set1.setFillAlpha(65);
+        set1.setFillColor(Color.BLACK);
+        // set1.setShader(new LinearGradient(0, 0, 0, mChart.getHeight(),
+        // Color.BLACK, Color.WHITE, Shader.TileMode.MIRROR));
+
+        ArrayList<LineDataSet> dataSets = new ArrayList<LineDataSet>();
+        dataSets.add(set1); // add the datasets
+
+        // create a data object with the datasets
+        LineData data = new LineData(xVals, dataSets);
+
+        LimitLine ll1 = new LimitLine(130f);
+        ll1.setLineWidth(4f);
+        ll1.enableDashedLine(10f, 10f, 0f);
+        ll1.setDrawValue(true);
+        ll1.setLabelPosition(LimitLine.LimitLabelPosition.RIGHT);
+
+        LimitLine ll2 = new LimitLine(-30f);
+        ll2.setLineWidth(4f);
+        ll2.enableDashedLine(10f, 10f, 0f);
+        ll2.setDrawValue(true);
+        ll2.setLabelPosition(LimitLine.LimitLabelPosition.RIGHT);
+
+        data.addLimitLine(ll1);
+        data.addLimitLine(ll2);
+
+        // set data
+        _graph.setData(data);
+    }*/
 
     /**
      * Sets up the joystick from scratch
@@ -291,7 +683,14 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 // Here you can use the joystick input to drive the connected robot. You can easily do this with the
                 // ConvenienceRobot#drive() method
                 // Note that the arguments do flip here from the order of parameters
-                _connectedRobot.drive((float)angle, (float)distanceFromCenter);
+                Log.d(TAG,String.format("Driving at %.2f with speed %d",angle,_speedSeek.getProgress()));
+                _connectedRobot.drive((float)angle, (float)_speedSeek.getProgress());//float)distanceFromCenter);
+                //mRSSIservice.getDevices();
+                //Log.d(TAG,_connectedRobot.getRobot().toString());
+                /*if (_connectedRobot.getRobot() instanceof RobotLE) {
+                    RobotLE robotLE = (RobotLE) _connectedRobot.getRobot();
+                    Log.i(TAG,String.format("ROBOT_INFO: Name: %s - ID: %s - Signal Quality: %f",robotLE.getName(),robotLE.getIdentifier(),robotLE.getSignalQuality()));
+                }*/
             }
 
             /**
@@ -357,9 +756,9 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
 
         // To set up the button, you need a calibration view. You get the button view, and then set it to the
         // calibration view that we just configured.
-        _calibrationButtonView = (CalibrationImageButtonView) findViewById(R.id.calibrateButton);
+       /* _calibrationButtonView = (CalibrationImageButtonView) findViewById(R.id.calibrateButton);
         _calibrationButtonView.setCalibrationView(_calibrationView);
-        _calibrationButtonView.setEnabled(false);
+        _calibrationButtonView.setEnabled(false);*/
     }
 
     /**
@@ -411,12 +810,92 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
                 public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
                     // We need to get the raw robot, as setting developer mode is an advanced function, and is not
                     // available on the Ollie object.
-                    ((RobotLE)_connectedRobot.getRobot()).setDeveloperMode(isChecked);
+                    RobotLE robotLE = (RobotLE) _connectedRobot.getRobot();
+                    robotLE.setDeveloperMode(isChecked);
+                    if(isChecked){
+                        _connectedRobot.enableCollisions(true);
+                        //_connectedRobot.enableLocator(true);
+                        _connectedRobot.enableSensors(
+                                SensorFlag.GYRO_NORMALIZED.longValue()
+                                        | SensorFlag.ACCELEROMETER_NORMALIZED.longValue()
+                                        | SensorFlag.LOCATOR.longValue(),
+                                SensorControl.StreamingRate.STREAMING_RATE100);
+                        //setData(45, 100);
+                        //_graph.invalidate();
+                    }
+                    else{
+                        _connectedRobot.disableSensors();
+                        _connectedRobot.enableLocator(false);
+                        _connectedRobot.enableCollisions(false);
+                        //_graph.setData(_dataGraph);
+                        //_graph.invalidate();
+                    }
                 }
             });
         }
         _developerModeLayout.setVisibility(View.VISIBLE);
     }
+
+
+    private final BroadcastReceiver mGattUpdateReceiver = new BroadcastReceiver() {
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            final String action = intent.getAction();
+            if (RSSI_Service.ACTION_GATT_DISCONNECTED.equals(action)) {
+                Log.d(TAG,"GATT Disconnected");
+            } else if (RSSI_Service.ACTION_GATT_SERVICES_DISCOVERED
+                    .equals(action)) {
+
+                Log.d(TAG,"GATT Services Discovered");
+                mRSSIservice.startReadRSSI(RSSI_Service.RSSI_RATE.FIVE_HZ);
+                //getGattService(mRSSIservice.getSupportedGattService());
+            } else if (RSSI_Service.ACTION_DATA_AVAILABLE.equals(action)) {
+                Log.d(TAG,"DATA available");
+                //data = intent.getByteArrayExtra(RSSI_Service.EXTRA_DATA);
+                //parseData(data);
+                //readAnalogInValue(data);
+            /*}else if (RSSI_Service.ACTION_GATT_RSSI_MEDIAN.equals(action)) {
+                String median = intent.getStringExtra(RSSI_Service.RSSI_DATA_MEDIAN);
+                _RSSI_median.setText(median);
+            */
+            }else if (RSSI_Service.ACTION_GATT_RSSI.equals(action)) {
+                Integer rssi = intent.getIntExtra(RSSI_Service.RSSI_DATA, 1);
+                Integer median = intent.getIntExtra(RSSI_Service.RSSI_DATA_MEDIAN, 1);
+                if (median < 0){
+                    Log.v(TAG, String.format("RSSI: %d => %s", rssi, median));
+                    _RSSI_median.setText(median.toString());
+                }
+                if (rssi >= 0){
+                    _RSSI_value.setText(" N/A ");
+                    Log.w(TAG,String.format("RSSI >= 0: (%d)",rssi));
+                }
+                else {
+                    _RSSI_value.setText(rssi.toString());
+
+                    /*
+                    int entryCount = _dataRSSIraw.getEntryCount();
+                    Log.d(TAG, String.format("1Graph has %d / %d entries (%d)", entryCount, MAXIMUM_GRAPH_LENGTH, _dataGraph.getXValCount()));
+                    boolean rem = false;
+                    if(entryCount >= MAXIMUM_GRAPH_LENGTH)
+                        rem = _dataRSSIraw.removeEntry(_dataRSSIraw.getEntryForXIndex(1));
+                    _dataRSSIraw.addEntry(new Entry(rssi, 0));
+                    _dataRSSIraw.notifyDataSetChanged();
+                    entryCount = _dataRSSIraw.getEntryCount();
+                    Log.d(TAG, String.format("Graph(%d) %s.", entryCount, (rem? "removed":"updated") ));
+                    Log.d(TAG, String.format("2Graph has %d / %d entries (%d)", entryCount, MAXIMUM_GRAPH_LENGTH, _dataGraph.getXValCount()));
+                    _dataGraph.notifyDataChanged();
+                    _graph.setData(_dataGraph);
+                    _graph.invalidate();
+                    Log.d(TAG, String.format("Graph(%d) %s.", entryCount, (rem? "removed":"updated") ));
+                    */
+
+                }
+            }
+        }
+
+
+    };
 
     /**
      * Starts discovery on the set discovery agent and look for robots
@@ -438,6 +917,74 @@ public class MainActivity extends Activity implements RobotPickerDialog.RobotPic
         } catch (DiscoveryException e) {
             Log.e(TAG, "Could not start discovery. Reason: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void handleResponse(DeviceResponse deviceResponse, Robot robot) {
+
+    }
+
+    @Override
+    public void handleStringResponse(String s, Robot robot) {
+
+    }
+
+    private LocatorSensor normalizeLocation(LocatorSensor current, LocatorSensor storedLocation){
+        current.x=current.x-storedLocation.x;
+        current.y=current.y-storedLocation.y;
+        return current;
+    }
+
+    private LocatorSensor updateLocation(LocatorSensor location, float x, float y){
+        location.x = x;
+        location.y = y;
+        return location;
+    }
+    private LocatorSensor updateLocation(LocatorSensor location, LocatorSensor newLocation){
+        location.x = newLocation.x;
+        location.y = newLocation.y;
+        return location;
+    }
+
+    @Override
+    public void handleAsyncMessage(AsyncMessage asyncMessage, Robot robot) {
+        Log.d(TAG,"Async found:");
+        if(asyncMessage instanceof DeviceSensorAsyncMessage){
+            //Log.d(TAG,"SensorAsync found:");
+            //only seems to be one data
+            //ArrayList<DeviceSensorsData> datas = ((DeviceSensorAsyncMessage) asyncMessage).getAsyncData();
+            //for (DeviceSensorsData data : datas){
+
+            ArrayList<DeviceSensorsData> asyncData = ((DeviceSensorAsyncMessage) asyncMessage).getAsyncData();
+            if(asyncData != null) {
+                DeviceSensorsData data = asyncData.get(0);
+                if(data != null) {
+                    LocatorSensor location = data.getLocatorData().getPosition();
+                    if (location != null){
+                        if(mNormalizedLocation != null){
+                            updateLocation(mLastLocation,location);
+                            normalizeLocation(location,mNormalizedLocation);
+                        }
+                        else{
+                            Log.w(TAG,"Unable to normalize Location data.");
+                        }
+                        _location.setText(location.toString());
+                    }
+                    else{
+                        _location.setText(data.getLocatorData().toString());
+                    }
+                    _gyro.setText(data.getGyroData().toString());
+                    _accel.setText(data.getAccelerometerData().toString());
+                }
+            }
+            /*Log.d(TAG,String.format("SensorData found(%d): [%s %s %s]",
+                    location.getTimeStamp(),
+                    location.toString(),
+                    gyro.toString(),
+                    accel.toString()
+            ));*/
+
         }
     }
 }
